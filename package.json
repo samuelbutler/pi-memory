@@ -2,6 +2,7 @@
   "name": "@samfp/pi-memory",
   "version": "1.0.2",
   "description": "Persistent memory for pi — learns corrections, preferences, and patterns from sessions and injects them into future conversations.",
+  "type": "module",
   "keywords": [
     "pi-package",
     "extension",
