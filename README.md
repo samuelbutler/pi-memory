@@ -20,18 +20,16 @@ pi install pi-total-recall
 Or install pi-memory standalone:
 
 ```bash
-pi install npm:@samfp/pi-memory
+pi install pi-memory
 ```
 
 Or add to `~/.pi/agent/settings.json`:
 
 ```json
 {
-  "packages": ["npm:@samfp/pi-memory"]
+  "packages": ["npm:pi-memory"]
 }
 ```
-
-> **Note:** Make sure you use the `@samfp/` scope. There is an unrelated `pi-memory` package on npm that will install instead if you omit the scope.
 
 ## Memory Types
 

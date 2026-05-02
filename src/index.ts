@@ -18,10 +18,12 @@
  * - memory_stats: show memory statistics
  */
 import type { ExtensionAPI, AgentToolResult } from "@mariozechner/pi-coding-agent";
-import { Type, type TSchema } from "@sinclair/typebox";
-import { join } from "node:path";
-import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
+import { Type } from "@sinclair/typebox";
+import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { MemoryStore } from "./store.js";
 import { buildContextBlock, type InjectorConfig } from "./injector.js";
 
@@ -137,16 +139,22 @@ export default function (pi: ExtensionAPI) {
   let pendingAssistantMessages: string[] = [];
   let sessionCwd: string = "";
   let sessionId: string | undefined;
-  let cachedCtx: any = null;
+  let statusClearTimer: ReturnType<typeof setTimeout> | undefined;
   let resolvedDbPath: string = DEFAULT_DB_PATH;
   let injectorConfig: InjectorConfig = readSettingsConfig();
 
   // ─── Lifecycle ───────────────────────────────────────────────────
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
+    if (event.reason === "reload") {
+      store = null;
+      pendingUserMessages = [];
+      pendingAssistantMessages = [];
+      return;
+    }
+
     try {
       sessionCwd = ctx.cwd;
-      cachedCtx = ctx;
       sessionId = (ctx as any).sessionId ?? (ctx as any).session?.id;
 
       // Resolve per-agent DB path from local settings or cwd
@@ -181,7 +189,13 @@ export default function (pi: ExtensionAPI) {
       const stats = store.stats();
       if (stats.semantic + stats.lessons > 0) {
         ctx.ui.setStatus("pi-memory", `Memory: ${stats.semantic} facts, ${stats.lessons} lessons`);
-        setTimeout(() => ctx.ui.setStatus("pi-memory", ""), 5000);
+        statusClearTimer = setTimeout(() => {
+          try {
+            ctx.ui.setStatus("pi-memory", "");
+          } catch {
+            // The context may be stale after /reload; ignore status cleanup.
+          }
+        }, 5000);
       }
     } catch (err: any) {
       ctx.ui.notify(`pi-memory: failed to open store: ${err.message}`, "warning");
@@ -237,20 +251,28 @@ export default function (pi: ExtensionAPI) {
     pendingAssistantMessages = [];
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (event) => {
     if (!store) return;
 
-    // Immediate visual feedback — user sees this as soon as C-c C-c fires
-    if (cachedCtx) {
-      cachedCtx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
+    if (event.reason === "reload") {
+      if (statusClearTimer) {
+        clearTimeout(statusClearTimer);
+        statusClearTimer = undefined;
+      }
+      store.close();
+      store = null;
+      pendingUserMessages = [];
+      pendingAssistantMessages = [];
+      return;
     }
 
-    // Consolidate if we have enough conversation
+    // Start consolidation out-of-process so quitting Pi is not blocked by the
+    // LLM call. The detached child owns its own `pi -p` run and DB connection.
     if (pendingUserMessages.length >= 3) {
       try {
-        await consolidateSession();
+        startBackgroundConsolidation();
       } catch {
-        // Best-effort — don't crash on shutdown
+        // Best-effort — don't crash or block shutdown
       }
     }
 
@@ -260,8 +282,8 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Consolidation ──────────────────────────────────────────────
 
-  async function consolidateSession(): Promise<void> {
-    if (!store) return;
+  function buildCurrentConsolidationPrompt(): string | undefined {
+    if (!store) return undefined;
 
     const input: ConsolidationInput = {
       userMessages: pendingUserMessages,
@@ -272,7 +294,14 @@ export default function (pi: ExtensionAPI) {
 
     const currentFacts = store.listSemantic(undefined, 200).map(f => ({ key: f.key, value: f.value }));
     const currentLessons = store.listLessons(undefined, 100).map(l => ({ rule: l.rule, category: l.category }));
-    const prompt = buildConsolidationPrompt(input, currentFacts, currentLessons);
+    return buildConsolidationPrompt(input, currentFacts, currentLessons);
+  }
+
+  async function consolidateSession(): Promise<void> {
+    if (!store) return;
+
+    const prompt = buildCurrentConsolidationPrompt();
+    if (!prompt) return;
 
     // Use pi's exec to call the LLM via a lightweight pi session.
     // Use a fast model to avoid blocking shutdown for too long.
@@ -300,6 +329,27 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function startBackgroundConsolidation(): void {
+    const prompt = buildCurrentConsolidationPrompt();
+    if (!prompt) return;
+
+    const payloadPath = join(tmpdir(), `pi-memory-${process.pid}-${Date.now()}.json`);
+    writeFileSync(payloadPath, JSON.stringify({
+      prompt,
+      dbPath: resolvedDbPath,
+      cwd: sessionCwd,
+      source: `session:${sessionId ?? "unknown"}`,
+    }));
+
+    const scriptPath = join(dirname(fileURLToPath(import.meta.url)), "background-consolidate.mjs");
+    const child = spawn(process.execPath, [scriptPath, payloadPath], {
+      cwd: sessionCwd || homedir(),
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+  }
+
   // ─── Tools ──────────────────────────────────────────────────────
 
   pi.registerTool({
@@ -310,7 +360,7 @@ export default function (pi: ExtensionAPI) {
       query: Type.String({ description: "Search query" }),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
     }) as any,
-    async execute(_id, params, _signal, _update, _ctx) {
+    async execute(_id: unknown, params: any, _signal: unknown, _update: unknown, _ctx: unknown) {
       if (!store) return ok("Memory store not initialized");
 
       const results = store.searchSemantic(params.query, params.limit ?? 10);
@@ -338,7 +388,7 @@ export default function (pi: ExtensionAPI) {
       category: Type.Optional(Type.String({ description: "Category for lessons (default: general)" })),
       negative: Type.Optional(Type.Boolean({ description: "True if this is something to AVOID" })),
     }) as any,
-    async execute(_id, params, _signal, _update, _ctx) {
+    async execute(_id: unknown, params: any, _signal: unknown, _update: unknown, _ctx: unknown) {
       if (!store) return ok("Memory store not initialized");
 
       // Defensively unwrap double-quoted string args from misbehaving model runners.
@@ -387,7 +437,7 @@ export default function (pi: ExtensionAPI) {
       key: Type.Optional(Type.String({ description: "Key for facts" })),
       id: Type.Optional(Type.String({ description: "ID for lessons" })),
     }) as any,
-    async execute(_id, params, _signal, _update, _ctx) {
+    async execute(_id: unknown, params: any, _signal: unknown, _update: unknown, _ctx: unknown) {
       if (!store) return ok("Memory store not initialized");
 
       params = {
@@ -423,7 +473,7 @@ export default function (pi: ExtensionAPI) {
       category: Type.Optional(Type.String({ description: "Filter by category" })),
       limit: Type.Optional(Type.Number({ description: "Max results (default 50)" })),
     }) as any,
-    async execute(_id, params, _signal, _update, _ctx) {
+    async execute(_id: unknown, params: any, _signal: unknown, _update: unknown, _ctx: unknown) {
       if (!store) return ok("Memory store not initialized");
 
       const lessons = store.listLessons(params.category, params.limit ?? 50);
@@ -444,7 +494,7 @@ export default function (pi: ExtensionAPI) {
     label: "Memory Stats",
     description: "Show memory statistics — how many facts, lessons, and events are stored.",
     parameters: Type.Object({}) as any,
-    async execute(_id, _params, _signal, _update, _ctx) {
+    async execute(_id: unknown, _params: unknown, _signal: unknown, _update: unknown, _ctx: unknown) {
       if (!store) return ok("Memory store not initialized");
 
       const stats = store.stats();
